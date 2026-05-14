@@ -14,7 +14,7 @@ Stack (locked):
 - Notifications: ntfy (self-hosted or hosted)
 - Config: YAML (one file, one source of truth)
 - Process supervision: systemd
-- Frame storage: 1 TB external USB 3.0 SSD on the Pi 5 (cannot stack PCIe NVMe HAT with AI HAT)
+- Frame storage: **256 GB** external USB 3.0 SSD on the Pi 5 with **tiered retention** (cannot stack PCIe NVMe HAT with AI HAT)
 
 Total active dev time: ~4 weeks of building + 2 weeks of observation.
 
@@ -32,7 +32,8 @@ print-vision/
 │   ├── extract_frames.py          # timelapses -> frames at 10s cadence
 │   ├── build_splits.py            # print_id assignment + stratified split
 │   ├── curate_eval_set.py         # interactive picker for held-out eval frames
-│   └── retention_cleanup.py       # 90-day frame deletion cron
+│   ├── retention_cleanup.py       # tiered retention: hot->warm at 7d, warm->delete at 90d
+│   └── healthy_sampler.py         # marks 1-in-100 healthy frames as 'sampled' for retraining diversity
 ├── training/
 │   ├── train_stage1.py            # binary healthy/failure
 │   ├── train_stage2.py            # multi-class on failure-only
@@ -242,7 +243,11 @@ notify:
 storage:
   frames_dir: /mnt/ssd/frames
   db_path: /mnt/ssd/print-vision.db
-  retention_days: 90
+  # Tiered retention (256 GB SSD constraint)
+  hot_retention_days: 7          # every frame kept this long
+  warm_retention_days: 90        # only flagged/sampled frames after hot tier
+  healthy_sample_rate: 0.01      # 1 in 100 healthy frames kept for retraining diversity
+  min_free_gb: 30                # bail out & alert if free space drops below this
 heartbeat:
   interval_minutes: 5
 ```
@@ -263,18 +268,40 @@ CREATE TABLE frames (
   print_id TEXT REFERENCES prints(id),
   printer_id TEXT NOT NULL,
   captured_at TIMESTAMP NOT NULL,
-  image_path TEXT NOT NULL,
+  image_path TEXT,                -- NULL after retention deletes the file; row stays
   stage1_label TEXT,
   stage1_confidence REAL,
   stage2_label TEXT,
   stage2_confidence REAL,
-  action_taken TEXT,             -- 'pause', 'notify_only', 'shadow_log', or NULL
+  action_taken TEXT,              -- 'pause', 'notify_only', 'shadow_log', or NULL
   operator_label TEXT,            -- 'confirmed', 'false_positive', or NULL
-  operator_responded_at TIMESTAMP
+  operator_responded_at TIMESTAMP,
+  is_healthy_sample INTEGER NOT NULL DEFAULT 0   -- 1 if picked for the 1-in-100 retraining sample
 );
 
 CREATE INDEX idx_frames_print ON frames(print_id);
 CREATE INDEX idx_frames_captured ON frames(captured_at);
+CREATE INDEX idx_frames_retention ON frames(captured_at, operator_label, stage1_label, is_healthy_sample);
+
+-- Retention queries (run nightly via retention_cleanup.py):
+--
+-- Hot tier expiry (>7 days, not flagged, not labeled, not sampled): delete file, NULL the path
+-- DELETE FROM disk WHERE id IN (
+--   SELECT id FROM frames
+--   WHERE captured_at < datetime('now', '-7 days')
+--     AND image_path IS NOT NULL
+--     AND operator_label IS NULL
+--     AND stage1_label != 'failure'
+--     AND is_healthy_sample = 0
+-- );
+--
+-- Warm tier expiry (>90 days, no operator label): delete file, NULL the path
+-- DELETE FROM disk WHERE id IN (
+--   SELECT id FROM frames
+--   WHERE captured_at < datetime('now', '-90 days')
+--     AND image_path IS NOT NULL
+--     AND operator_label IS NULL
+-- );
 ```
 
 `service/main.py` orchestration (pseudo):
@@ -409,7 +436,7 @@ Acceptance:
 Goal: deploy to all 10 printers, no auto-pause, measure false-positive rate.
 
 Steps:
-1. Mount 1 TB external USB SSD on Pi 5 at `/mnt/ssd`
+1. Mount **256 GB external USB 3.0 SSD** on Pi 5 at `/mnt/ssd`. Format as ext4 (avoid exFAT — slow for many-small-file workloads).
 2. Copy code: `git clone` on Pi, `uv sync`
 3. Place `config.yaml` with all 10 printer entries, `shadow_mode: true`
 4. Install systemd unit (`deploy/print-vision.service`):
@@ -420,7 +447,11 @@ Steps:
    RestartSec=10
    ```
 5. `systemctl enable --now print-vision`
-6. Set up retention cron: `0 3 * * * /opt/print-vision/.venv/bin/python scripts/retention_cleanup.py`
+6. Set up tiered retention cron (run daily at 03:00):
+   ```
+   0 3 * * * /opt/print-vision/.venv/bin/python scripts/retention_cleanup.py
+   ```
+   The script deletes hot-tier files >7 days old (unless flagged/labeled/sampled) and warm-tier files >90 days old (unless operator-labeled). Always check free disk space first and log per-tier counts removed.
 7. Watch for one full week. Track:
    - How many "would-pause" decisions fired
    - How many were false positives (you decide by reviewing the snapshot)
@@ -500,6 +531,8 @@ Acceptance:
 | INT8 quantization causes accuracy drop > 3% | Expand calibration set with more failure examples; re-run optimize step |
 | Hosted ntfy goes down | Self-host ntfy on the Pi alongside the service |
 | Operator stops tapping buttons | Plan v2 retraining cadence based on calendar (quarterly), not just label count |
+| 256 GB SSD fills up unexpectedly | `min_free_gb: 30` config bail-out + retention script logs free space daily. If hit, raise sampling rate threshold or shorten hot retention. Spare is a $20 swap. |
+| Retention script bug deletes too much | All retention queries use `image_path IS NOT NULL` predicate AND skip operator-labeled frames. SQLite rows preserved even after disk delete — full audit trail. Test on a dev SQLite before running on prod. |
 
 ---
 

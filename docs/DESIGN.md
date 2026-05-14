@@ -85,7 +85,21 @@ A natural v1.5 extension is to layer Approach C's VLM verifier on top of B once 
 6. **Decision layer.** Rolling-window vote: 3 of last 5 frames flagged as `failure` at stage 1 → pause. Per-class confidence thresholds tuned against the eval set.
 7. **Action layer.** Pause: call OctoPrint pause API with retry-with-backoff (3 attempts, 2s/5s/10s). If all fail, escalate to a "PAUSE FAILED" notification (per noted mitigation). Notification: ntfy with two inline action buttons — `Real failure` and `False alarm`. Button tap writes operator_label to SQLite (per Issue 2 labeling loop). Frame snapshot embedded.
 8. **Shadow mode (per eng review Issue 5).** A `SHADOW_MODE=true` flag in config replaces the OctoPrint pause API call with a `log_what_would_have_happened()` write. Notifications still send. Run in this mode on all 10 printers for one week minimum before flipping to live.
-9. **Frame retention (per eng review Issue 6).** Save every captured frame to disk for 90 days, then auto-delete unless the frame is flagged (stage 1 said failure) or labeled (operator tapped a button). Cron job nightly. **Storage budget at 10s cadence:** 10 printers × 1 frame/10s × 86400 s/day × ~100 KB ≈ **8.6 GB/day**, ≈ **775 GB at 90-day peak**. Provision a 1 TB external SSD for the inference host. (Compared to 30s cadence which would have been ~260 GB peak — the 3x storage cost is real but cheap.)
+9. **Frame retention — tiered (per eng review Issue 6).** Saving every frame at native resolution for 90 days would need ~775 GB. Tiered storage cuts active footprint to ~75 GB peak so a 256 GB SSD is sufficient with 3x headroom. Cron job runs nightly to move/delete across tiers.
+
+   | Tier | What stays | Retention | Size |
+   |---|---|---|---|
+   | Hot | Every frame, full resolution | 7 days | ~60 GB |
+   | Warm | Frames flagged by stage 1 (failure) | 90 days | ~5 GB |
+   | Warm | 1-in-100 healthy sample (retraining diversity) | 90 days | ~8 GB |
+   | Cold | Any frame with an `operator_label` (gold for retraining) | forever | grows slowly |
+
+   Daily retention pass:
+   - Frames older than 7 days, not flagged, not labeled, not sampled → delete from disk, set `image_path = NULL` in SQLite
+   - Frames in warm tier older than 90 days, no operator label → delete from disk, set `image_path = NULL`
+   - Frames with `operator_label IS NOT NULL` → never deleted automatically
+
+   SQLite row is retained even after the file is deleted — the prediction history stays for analytics and FP/FN tracking.
 10. **Reliability mitigations.**
     - systemd unit with `Restart=always` for the inference service.
     - Heartbeat: service publishes "alive" to ntfy every 5 minutes; a separate watchdog on the mini-PC sends "service is dead" if no heartbeat for 10 min.
@@ -121,7 +135,7 @@ Still open, resolved by dataset audit:
 
 - OctoPrint REST API access on all 10 printers (likely already configured if cameras are working through OctoPrint).
 - Inference host (see Hardware section below).
-- 1 TB external SSD for frame storage (90-day rolling retention at 10s cadence).
+- 256 GB external USB 3.0 SSD for frame storage (tiered retention scheme — see implementation shape step 9).
 - Python ML stack: PyTorch, torchvision/timm, OpenCV, FastAPI for the inference service.
 - ONNX + TensorRT (Jetson) or onnxruntime (Pi 5) for deployed inference.
 - Notification provider: ntfy (free, self-hostable) is the lowest-friction choice.
@@ -132,7 +146,7 @@ Still open, resolved by dataset audit:
 - ~$80 Pi 5 8GB + ~$249 Hailo-8 AI HAT = ~$330 total
 - 26 TOPS INT8 via Hailo-8. Handles YOLOv8n-cls at >300 fps; the system needs 1 fps total. ~300x headroom.
 - Low power (~10 W total), passive cooling sufficient, GPIO available for future printer integration
-- Connect a 1 TB external SSD via USB 3.0 for frame storage, OR use a Pi 5 PCIe NVMe HAT (note: cannot stack with AI HAT — pick one or use USB SSD)
+- Connect a **256 GB external USB 3.0 SSD** for frame storage (PCIe NVMe HAT cannot stack with AI HAT — USB is the path). Pi 5 boots from microSD; SSD is data-only. 256 GB works only because storage is tiered (see implementation shape step 9).
 - Toolchain tradeoff: Hailo Dataflow Compiler is less mature than NVIDIA's TensorRT. Model conversion (ONNX → HEF) requires an INT8 calibration set every time you compile. Plan for an extra step in the build pipeline; not hard, just real work.
 
 ### Inference host (fallback): Jetson Orin Nano 8GB
@@ -238,7 +252,7 @@ Hailo is **INT8-only**. The calibration set is mandatory — feed the compiler ~
 7. **Wire model + notifications + labeling buttons.** Stage 1 model in service. ntfy notifications with `Real failure` / `False alarm` action buttons. Operator taps land in SQLite.
 8. **Shadow mode on all 10 printers, one week minimum.** `SHADOW_MODE=true`. Service runs everywhere, predicts everywhere, notifies everywhere, never actually pauses. Tune thresholds against measured false-positive rate.
 9. **Flip to live on one printer for one week.** First production printer with auto-pause enabled. Watch closely.
-10. **Roll to all 10.** Add heartbeat watchdog. Set up 90-day frame retention cron. Start using accumulated labeled data for v2 training.
+10. **Roll to all 10.** Add heartbeat watchdog. Set up tiered retention cron (7-day hot, 90-day warm, forever cold). Start using accumulated labeled data for v2 training.
 
 ## NOT in scope (v1)
 

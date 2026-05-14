@@ -16,7 +16,7 @@ Computer vision system for detecting in-progress failures across a 10-printer 3D
 
 ## At a glance
 
-- **Hardware:** Raspberry Pi 5 8GB + Hailo-8 AI HAT (26 TOPS) + 1 TB external USB SSD
+- **Hardware:** Raspberry Pi 5 8GB + Hailo-8 AI HAT (26 TOPS) + 256 GB external USB SSD (with tiered retention)
 - **Model:** YOLOv8n-cls (stage 1 binary healthy/failure), YOLOv8s-cls (stage 2 multi-class failure type)
 - **Inference cadence:** one frame per printer every 10 seconds
 - **Detection coverage:** full print duration (not just first 10 minutes)
