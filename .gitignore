@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# uv
+.uv/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific: data and models stay out of git
+print_data/
+frames/
+models/
+runs/
+*.pt
+*.onnx
+*.engine
+*.hef
+*.har
+calib_frames/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Config with secrets
+config.yaml
+.env
+
+# Logs
+*.log
+logs/
