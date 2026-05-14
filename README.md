@@ -11,6 +11,7 @@ Computer vision system for detecting in-progress failures across a 10-printer 3D
 | [docs/DESIGN.md](docs/DESIGN.md) | Problem statement, premises, approaches considered, recommended approach, failure modes, what's NOT in scope. |
 | [docs/ENGINEERING_PLAN.md](docs/ENGINEERING_PLAN.md) | Concrete 10-milestone build plan with file structure, SQLite schema, config shape, acceptance criteria per milestone. |
 | [docs/DATASET_STRUCTURE.md](docs/DATASET_STRUCTURE.md) | How training data is organized on disk: raw → labels.csv → frames → YOLO symlink views. |
+| [docs/TRAINING_HARDWARE.md](docs/TRAINING_HARDWARE.md) | Training on RunPod cloud GPU: full step-by-step recipe, ~$1/run. |
 | [docs/TEST_PLAN.md](docs/TEST_PLAN.md) | Test plan — interactions to verify, edge cases, critical end-to-end paths, eval methodology. |
 
 ## At a glance
