@@ -42,6 +42,7 @@ Tracked per milestone in [ENGINEERING_PLAN.md](docs/ENGINEERING_PLAN.md):
 
 - [ ] M0 — Project setup
 - [ ] M1 — Dataset audit
+- [ ] M1.5 — Label failure boundaries (interactive video scrubbing for ~287 failed timelapses)
 - [ ] M2 — Dataset prep
 - [ ] M3 — Stage 1 training
 - [ ] M4 — Stage 2 training
