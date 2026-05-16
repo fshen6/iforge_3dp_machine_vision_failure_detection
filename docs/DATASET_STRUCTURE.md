@@ -79,37 +79,42 @@ print_data/
 This is the one file you edit when you find a mislabeled timelapse. Everything else regenerates from it.
 
 ```csv
-print_id,source_file,printer_id,started_at,outcome,failure_type,failure_at_seconds,duration_seconds
-print_001,raw/successful/print_001_printer03.mp4,printer_03,2026-02-14T09:12:00,success,,,28800
-print_002,raw/successful/print_002_printer07.mp4,printer_07,2026-02-14T09:45:00,success,,,14400
-print_456,raw/failed/print_456_printer02_bed_adhesion.mp4,printer_02,2026-03-22T11:30:00,failure,bed_adhesion,180,420
-print_457,raw/failed/print_457_printer05_spaghetti.mp4,printer_05,2026-03-22T14:15:00,failure,spaghetti,21600,21900
+print_id,source_file,printer_id,started_at,outcome,failure_type,failure_at_frame,duration_seconds
+print_0001,raw/successful/Tolstoy/DSC_0001.mp4,Tolstoy,2026-02-14T09:12:00,success,,,28800
+print_0002,raw/successful/Bell/IMG_77.mp4,Bell,2026-02-14T09:45:00,success,,,14400
+print_0456,raw/failed/bed_adhesion/Tolstoy/oops.mp4,Tolstoy,2026-03-22T11:30:00,failure,bed_adhesion,5400,420
+print_0457,raw/failed/spaghetti/Bell/spag1.mp4,Bell,2026-03-22T14:15:00,failure,spaghetti,648000,21900
 ```
 
 | Column | Meaning |
 |---|---|
-| `print_id` | Unique ID per print, derived from filename. Use this for splits, never the filename. |
-| `printer_id` | Which physical printer (`printer_01` … `printer_10`). Used for stratification. |
+| `print_id` | Unique ID per print, auto-assigned by `audit_dataset.py`. Use this for splits, never the filename. |
+| `printer_id` | Which physical printer (`Tolstoy`, `Bell`, `Socrates`, `Einstein`, `Beethoven`, `Watt`, `Hypatia`, `Picasso`). Used for stratification. |
 | `outcome` | `success` or `failure`. Drives stage 1 labels. |
 | `failure_type` | `spaghetti` / `bed_adhesion` / `layer_shift` / `other`. Drives stage 2 labels. NULL for successes. |
-| `failure_at_seconds` | When did the failure visually start. NULL for successes. |
+| `failure_at_frame` | Raw-video frame index where the failure visually starts (mpv's `estimated-frame-number`). NULL for successes. |
 | `duration_seconds` | Total length of the timelapse. |
 
 ## The frame-labeling rule (the part most people get wrong)
 
 A failed timelapse contains frames that span healthy → failure. You cannot label every frame in a failed file as a failure example — most of them are healthy, the failure happened at some point.
 
-Use `failure_at_seconds` to split each failed timelapse's frames:
+Use `failure_at_frame` to split each failed timelapse's frames. The ambiguity window is a fixed frame count `AMBIGUITY_FRAMES` (set in your decode config — pick a value that covers ~30s of source playback, e.g. `900` for 30 fps footage):
 
-| Frame time | Stage 1 label | Stage 2 label |
+| Raw-video frame index | Stage 1 label | Stage 2 label |
 |---|---|---|
-| t < failure_at − 30s | drop (conservative) — or add to `healthy` if you want more healthy data | n/a |
-| failure_at − 30s ≤ t < failure_at | **drop** — ambiguous "warning sign" zone | n/a |
-| t ≥ failure_at | `failure` | `<failure_type>` |
+| `frame < failure_at_frame − AMBIGUITY_FRAMES` | candidate `healthy` | n/a |
+| `failure_at_frame − AMBIGUITY_FRAMES ≤ frame < failure_at_frame` | **drop** — ambiguous "warning sign" zone | n/a |
+| `frame ≥ failure_at_frame` | `failure` | `<failure_type>` |
 
 For successful prints: every frame is `healthy` for stage 1, excluded from stage 2.
 
-This rule is why `failure_at_seconds` precision matters. The more precise this number, the cleaner your training signal.
+`failure_at_frame` is captured by the labeler from mpv's `estimated-frame-number`, which counts raw encoded frames from the start of the file. Two consequences worth knowing:
+
+1. **Frame index depends on each video's encoded fps.** Don't compare raw frame counts across timelapses with different fps — convert to seconds (`frame / fps`) first when you need physical-time comparisons.
+2. **Decoded frames live in a different index space.** The 10s-cadence decoder takes one frame every `10 × fps` raw frames, so the decoded frame index where failure starts is `failure_at_frame / (10 × fps)` (rounded). The decode pipeline does this conversion when it materializes `frames/`.
+
+This rule is why `failure_at_frame` precision matters. Frame-level precision is what the labeler captures — don't round it manually.
 
 ## Split strategy
 

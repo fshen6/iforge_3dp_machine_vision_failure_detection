@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Interactive failure-boundary labeling helper (Milestone 1.5).
 
-Reads labels.csv, finds failed timelapses without a failure_at_seconds value,
+Reads labels.csv, finds failed timelapses without a failure_at_frame value,
 opens each in mpv, and lets you press Enter at the moment the failure visually
-starts. The current playhead time is saved back to labels.csv as an integer
-number of seconds.
+starts. mpv's current frame number (estimated-frame-number) is saved back to
+labels.csv as an integer raw-video frame index.
 
 Usage:
     python scripts/label_failure_boundaries.py \\
@@ -47,9 +47,15 @@ local function write(cmd, value)
 end
 
 mp.add_key_binding("ENTER", "labeler-save", function()
+    local frame = mp.get_property_number("estimated-frame-number")
     local t = mp.get_property_number("time-pos") or 0
-    write("save", string.format("%.3f", t))
-    mp.osd_message(string.format("SAVED failure_at_seconds = %.0fs", t), 1)
+    if frame == nil then
+        -- Fallback when mpv can't estimate: derive frame from time-pos × container fps.
+        local fps = mp.get_property_number("container-fps") or mp.get_property_number("fps") or 0
+        frame = math.floor(t * fps + 0.5)
+    end
+    write("save", string.format("%d", frame))
+    mp.osd_message(string.format("SAVED failure_at_frame = %d  (t = %.1fs)", frame, t), 1)
     mp.add_timeout(0.4, function() mp.command("quit 0") end)
 end)
 
@@ -92,7 +98,7 @@ def load_rows(labels_path: Path) -> tuple[list[dict], list[str]]:
         reader = csv.DictReader(f)
         fieldnames = reader.fieldnames or []
         rows = list(reader)
-    required = {"print_id", "source_file", "outcome", "failure_type", "failure_at_seconds"}
+    required = {"print_id", "source_file", "outcome", "failure_type", "failure_at_frame"}
     missing = required - set(fieldnames)
     if missing:
         sys.exit(f"error: labels.csv missing required columns: {sorted(missing)}")
@@ -115,7 +121,7 @@ def save_rows_atomic(labels_path: Path, rows: list[dict], fieldnames: list[str])
 
 
 def is_pending(row: dict) -> bool:
-    return row.get("outcome", "").strip() == "failure" and not (row.get("failure_at_seconds") or "").strip()
+    return row.get("outcome", "").strip() == "failure" and not (row.get("failure_at_frame") or "").strip()
 
 
 def launch_mpv(mpv: str, video_path: Path, title: str, lua_path: Path, sidecar: Path) -> None:
@@ -159,7 +165,7 @@ def main() -> int:
             sys.exit(f"error: --start-at {args.start_at!r} not found among pending rows")
 
     if not pending_indices:
-        print("Nothing to label — every failed print already has failure_at_seconds.")
+        print("Nothing to label — every failed print already has failure_at_frame.")
         return 0
 
     print(f"Labeling {len(pending_indices)} failed timelapses. mpv keys:")
@@ -205,11 +211,11 @@ def main() -> int:
                     sidecar.unlink()
 
             if cmd == "save":
-                seconds = int(round(float(value)))
-                row["failure_at_seconds"] = str(seconds)
+                frame = int(round(float(value)))
+                row["failure_at_frame"] = str(frame)
                 save_rows_atomic(args.labels, rows, fieldnames)
                 saved += 1
-                print(f"{tag}  saved failure_at_seconds = {seconds}s")
+                print(f"{tag}  saved failure_at_frame = {frame}")
             elif cmd == "quit":
                 print(f"{tag}  session quit — resume by rerunning the script")
                 break

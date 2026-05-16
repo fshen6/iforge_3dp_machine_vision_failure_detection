@@ -122,17 +122,17 @@ Acceptance:
 
 **Decision gate after this milestone:** If any failure class has < 30 examples, drop it from stage 2 or merge into `other_failure`.
 
-**Second decision gate:** If `failure_at_seconds` is missing or "rough" for many videos, you must complete Milestone 1.5 before Milestone 2. Without per-video failure timestamps, you cannot construct clean failure-class frames — most frames in a failed timelapse are still healthy footage.
+**Second decision gate:** If `failure_at_frame` is missing or "rough" for many videos, you must complete Milestone 1.5 before Milestone 2. Without per-video failure boundaries, you cannot construct clean failure-class frames — most frames in a failed timelapse are still healthy footage.
 
 ---
 
 ## Milestone 1.5 — Label Failure Boundaries (0.5 day build + 2-3 hours labeling)
 
-Goal: every failed timelapse has a `failure_at_seconds` value in `labels.csv` recording when the failure visually started.
+Goal: every failed timelapse has a `failure_at_frame` value in `labels.csv` recording the raw-video frame index where the failure visually starts.
 
 Deliverables:
 - `scripts/label_failure_boundaries.py` — interactive video-scrubbing helper
-- Updated `labels.csv` with `failure_at_seconds` populated for every `outcome=failure` row
+- Updated `labels.csv` with `failure_at_frame` populated for every `outcome=failure` row
 
 Operational definition of "failure visually starts" (use consistently across the labeling session):
 
@@ -144,24 +144,24 @@ Operational definition of "failure visually starts" (use consistently across the
 | `other` | First frame where any clear failure indicator becomes visible |
 
 Rules:
-- Precision of ±5 seconds is sufficient. Don't agonize past that.
+- Frame-level precision is what mpv reports — let the labeler write it as-is. Don't agonize past a handful of frames.
 - If torn between two candidate frames, pick the **earlier** one.
 - If a failure is multi-mode (warping → spaghetti), use the earlier event.
 
 Steps:
 1. Write `scripts/label_failure_boundaries.py`:
-   - Read `labels.csv`, filter to rows where `outcome=failure` and `failure_at_seconds IS NULL`
-   - For each video, open in mpv/ffplay at the recorded approximate time (or t=0 if unknown)
-   - Scrub controls: keys for ±1s, ±5s, ±30s, ±2min
-   - Press a key (e.g. `L`) to record current timestamp as `failure_at_seconds`
+   - Read `labels.csv`, filter to rows where `outcome=failure` and `failure_at_frame IS NULL`
+   - For each video, open in mpv at t=0
+   - Scrub controls: keys for ±1s, ±5s, ±30s, ±2min (mpv seeks in seconds; the captured value is a frame index)
+   - Press `Enter` to record mpv's current `estimated-frame-number` as `failure_at_frame`
    - Write back to `labels.csv` immediately (so a crash mid-session doesn't lose work)
-   - Optional `Q` to quit and resume later (idempotent on re-run)
+   - `Shift+Q` to quit and resume later (idempotent on re-run)
 2. Label all `~287` failed videos. Expect ~30-60 seconds per video. Total: 2-3 hours.
 3. Take a 5-min break every 50 videos to prevent label drift from fatigue.
 
 Acceptance:
-- 100% of `outcome=failure` rows have a non-null `failure_at_seconds`
-- Spot-check: pick 5 random failed videos, manually verify the recorded timestamp is within ±10s of where you'd put it on a re-watch
+- 100% of `outcome=failure` rows have a non-null `failure_at_frame`
+- Spot-check: pick 5 random failed videos, manually verify the recorded frame is within a couple seconds (frame / fps) of where you'd put it on a re-watch
 
 This step is what makes the data pipeline work. Skipping it produces a model that's been trained on poisoned failure-class frames (most of which were actually healthy footage). Don't skip.
 

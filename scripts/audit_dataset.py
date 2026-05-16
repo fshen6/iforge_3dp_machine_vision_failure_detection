@@ -5,10 +5,10 @@ Walks the canonical dataset layout under --videos-root, ffprobes each video
 in parallel for duration and resolution, and produces:
 
   1. labels.csv  — the dataset's single source of truth. Idempotent across
-                   re-runs: print_ids and failure_at_seconds values are
+                   re-runs: print_ids and failure_at_frame values are
                    preserved by matching source_file (or printer_id+basename
                    as a fallback, so a file moved between failure-type
-                   folders keeps its timestamp).
+                   folders keeps its label).
   2. DATASET_AUDIT.md — one-page human-readable summary.
   3. stdout summary matching the format in docs/ENGINEERING_PLAN.md M1.
 
@@ -273,8 +273,11 @@ def merge_preserved_fields(rows: list[dict], existing: list[dict]) -> list[str]:
         )
         if not prev:
             continue
-        if (prev.get("failure_at_seconds") or "").strip():
-            row["failure_at_seconds"] = prev["failure_at_seconds"]
+        if (prev.get("failure_at_frame") or "").strip():
+            row["failure_at_frame"] = prev["failure_at_frame"]
+        # Back-compat: if an older labels.csv from before the rename still has
+        # failure_at_seconds set, carry the value into failure_at_frame is impossible
+        # without per-video fps, so we drop it silently and the user re-labels.
         if (prev.get("started_at") or "").strip():
             row["started_at"] = prev["started_at"]
         # If a human reclassified failure_type in labels.csv (vs the folder), flag the conflict
@@ -453,7 +456,7 @@ def render_audit_md(s: dict, generated_at: str, videos_root: Path) -> str:
         )
     else:
         lines.append(f"- ✓ All failure classes have ≥ {MIN_CLASS_EXAMPLES} examples — stage 2 viable.")
-    lines.append("- `failure_at_seconds` precision: TBD — run M1.5 next.")
+    lines.append("- `failure_at_frame` precision: TBD — run M1.5 next.")
     lines.append("")
     return "\n".join(lines)
 
@@ -520,7 +523,7 @@ def main() -> int:
 
     # Initialize CSV-shaped fields on every row.
     for d in discoveries:
-        d.setdefault("failure_at_seconds", "")
+        d.setdefault("failure_at_frame", "")
         d.setdefault("failure_type", d.get("failure_type") or "")
         d.setdefault("started_at", d.get("started_at") or "")
 
@@ -531,7 +534,7 @@ def main() -> int:
 
     fieldnames = [
         "print_id", "source_file", "printer_id", "started_at",
-        "outcome", "failure_type", "failure_at_seconds", "duration_seconds",
+        "outcome", "failure_type", "failure_at_frame", "duration_seconds",
     ]
     csv_rows = [{k: r.get(k, "") for k in fieldnames} for r in discoveries]
     save_labels_atomic(labels_path, csv_rows, fieldnames)
