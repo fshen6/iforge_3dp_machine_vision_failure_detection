@@ -37,6 +37,7 @@ Thumbs.db
 
 # Project-specific: data and models stay out of git
 print_data/
+3dp computer vision training data/
 frames/
 models/
 runs/
