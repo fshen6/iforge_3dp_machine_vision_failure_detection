@@ -28,12 +28,12 @@ print_data/
 ├── labels.csv                            # SINGLE SOURCE OF TRUTH for metadata
 │
 ├── frames/                               # DECODED ONCE, grouped by print_id (no class folders)
-│   ├── print_001/
-│   │   ├── 000000.jpg                    (frame at t=0s)
-│   │   ├── 000010.jpg                    (frame at t=10s)
-│   │   ├── 000020.jpg
+│   ├── print_0001/
+│   │   ├── 000000.jpg                    (frame 0 = layer 1)
+│   │   ├── 000001.jpg                    (frame 1 = layer 2)
+│   │   ├── 000002.jpg
 │   │   └── ...
-│   ├── print_002/
+│   ├── print_0002/
 │   └── ...
 │
 ├── splits.json                           # print_id → train | val | test | eval
@@ -79,11 +79,11 @@ print_data/
 This is the one file you edit when you find a mislabeled timelapse. Everything else regenerates from it.
 
 ```csv
-print_id,source_file,printer_id,started_at,outcome,failure_type,failure_at_frame,duration_seconds
-print_0001,raw/successful/Tolstoy/DSC_0001.mp4,Tolstoy,2026-02-14T09:12:00,success,,,28800
-print_0002,raw/successful/Bell/IMG_77.mp4,Bell,2026-02-14T09:45:00,success,,,14400
-print_0456,raw/failed/bed_adhesion/Tolstoy/oops.mp4,Tolstoy,2026-03-22T11:30:00,failure,bed_adhesion,5400,420
-print_0457,raw/failed/spaghetti/Bell/spag1.mp4,Bell,2026-03-22T14:15:00,failure,spaghetti,648000,21900
+print_id,source_file,printer_id,started_at,outcome,failure_type,failure_at_frame,frame_count,duration_seconds
+print_0001,raw/successful/Tolstoy/DSC_0001.mp4,Tolstoy,2026-02-14T09:12:00,success,,,480,8
+print_0002,raw/successful/Bell/IMG_77.mp4,Bell,2026-02-14T09:45:00,success,,,240,10
+print_0456,raw/failed/bed_adhesion/Tolstoy/oops.mp4,Tolstoy,2026-03-22T11:30:00,failure,bed_adhesion,47,212,4
+print_0457,raw/failed/spaghetti/Bell/spag1.mp4,Bell,2026-03-22T14:15:00,failure,spaghetti,830,1100,18
 ```
 
 | Column | Meaning |
@@ -92,29 +92,29 @@ print_0457,raw/failed/spaghetti/Bell/spag1.mp4,Bell,2026-03-22T14:15:00,failure,
 | `printer_id` | Which physical printer (`Tolstoy`, `Bell`, `Socrates`, `Einstein`, `Beethoven`, `Watt`, `Hypatia`, `Picasso`). Used for stratification. |
 | `outcome` | `success` or `failure`. Drives stage 1 labels. |
 | `failure_type` | `spaghetti` / `bed_adhesion` / `layer_shift` / `other`. Drives stage 2 labels. NULL for successes. |
-| `failure_at_frame` | Raw-video frame index where the failure visually starts (mpv's `estimated-frame-number`). NULL for successes. |
-| `duration_seconds` | Total length of the timelapse. |
+| `failure_at_frame` | Frame index where the failure visually starts (mpv's `estimated-frame-number`, 0-based). Equivalent to layer index since timelapses capture one frame per layer. NULL for successes. |
+| `frame_count` | Total frames in the video = total layers in the print. Use this for size stratification. |
+| `duration_seconds` | Encoded playback duration. Cosmetic — it's just `frame_count / fps` and varies with the (unimportant) encoded fps. |
+
+> **One frame = one print layer.** Timelapses are captured one frame per printed layer. The video's encoded fps (25 or 60 in the current archive) is purely a playback-speed choice and has no effect on labels — `failure_at_frame = 47` means the failure starts at layer 48 (frame indices are 0-based) regardless of fps. Don't try to convert frame index to seconds: physical print time isn't recoverable from the video alone.
 
 ## The frame-labeling rule (the part most people get wrong)
 
 A failed timelapse contains frames that span healthy → failure. You cannot label every frame in a failed file as a failure example — most of them are healthy, the failure happened at some point.
 
-Use `failure_at_frame` to split each failed timelapse's frames. The ambiguity window is a fixed frame count `AMBIGUITY_FRAMES` (set in your decode config — pick a value that covers ~30s of source playback, e.g. `900` for 30 fps footage):
+Use `failure_at_frame` to split each failed timelapse's frames. The ambiguity window is a fixed frame count `AMBIGUITY_LAYERS` — the number of layers immediately before the called failure that are dropped as ambiguous "warning sign" frames. Default: **5 layers**. Tune up if you find the model learning early-warning patterns that don't generalize:
 
-| Raw-video frame index | Stage 1 label | Stage 2 label |
+| Frame (layer) index | Stage 1 label | Stage 2 label |
 |---|---|---|
-| `frame < failure_at_frame − AMBIGUITY_FRAMES` | candidate `healthy` | n/a |
-| `failure_at_frame − AMBIGUITY_FRAMES ≤ frame < failure_at_frame` | **drop** — ambiguous "warning sign" zone | n/a |
+| `frame < failure_at_frame − AMBIGUITY_LAYERS` | candidate `healthy` | n/a |
+| `failure_at_frame − AMBIGUITY_LAYERS ≤ frame < failure_at_frame` | **drop** — ambiguous "warning sign" layers | n/a |
 | `frame ≥ failure_at_frame` | `failure` | `<failure_type>` |
 
 For successful prints: every frame is `healthy` for stage 1, excluded from stage 2.
 
-`failure_at_frame` is captured by the labeler from mpv's `estimated-frame-number`, which counts raw encoded frames from the start of the file. Two consequences worth knowing:
+Since one frame = one printed layer, the rule is comparable across all your videos without any fps conversion. The same `AMBIGUITY_LAYERS` applies whether a video is encoded at 25 fps or 60 fps.
 
-1. **Frame index depends on each video's encoded fps.** Don't compare raw frame counts across timelapses with different fps — convert to seconds (`frame / fps`) first when you need physical-time comparisons.
-2. **Decoded frames live in a different index space.** The 10s-cadence decoder takes one frame every `10 × fps` raw frames, so the decoded frame index where failure starts is `failure_at_frame / (10 × fps)` (rounded). The decode pipeline does this conversion when it materializes `frames/`.
-
-This rule is why `failure_at_frame` precision matters. Frame-level precision is what the labeler captures — don't round it manually.
+**Decoding implication.** The 10s-cadence inference plan in this doc was written assuming fixed-rate timelapses. With layer-per-frame capture, "10s cadence at inference time" is the printer's wall-clock layer time during a print, not a property of the training videos. For training, you can use **every raw frame** as a candidate sample — there's no decode/subsample step needed. The training pipeline reads frames directly from the .mp4s.
 
 ## Split strategy
 
@@ -137,9 +137,9 @@ The `eval` split is held out from training **and** from threshold tuning. It exi
 
 ## Image format
 
-- **Cadence:** 10s — matches inference cadence, no train/serve skew
-- **Format:** JPEG quality 90 — fine for vision, much smaller than PNG
-- **Resize at decode time:** 256×256 — Ultralytics will random-crop to 224×224 during training
+- **Cadence:** one decoded JPEG per raw video frame = one per printed layer. No subsampling. Inference at runtime polls one frame per layer-completion event, matching training cadence exactly.
+- **Format:** JPEG quality 90 — fine for vision, much smaller than PNG.
+- **Resize at decode time:** 256×256 — Ultralytics will random-crop to 224×224 during training.
 - **Aspect:** preserve original via letterbox OR center-crop to square — pick one and stay consistent. Center-crop is simpler if camera framing is uniform.
 
 ## Why this design
@@ -152,12 +152,12 @@ The `eval` split is held out from training **and** from threshold tuning. It exi
 
 ## Disk budget estimates
 
-Assumptions: ~1300 timelapses, average duration ~1 hour, decoded at 10s cadence = ~470K frames decoded total.
+Assumptions: ~1300 timelapses, average ~400 layers per print = ~520K frames decoded total (run `audit_dataset.py` to see actual `frame_count` distribution).
 
 | Folder | Size estimate |
 |---|---|
 | `raw/` | 50-100 GB (your current archive) |
-| `frames/` | 10-15 GB (256×256 JPEG q90, ~25 KB per frame × 470K frames) |
+| `frames/` | 10-15 GB (256×256 JPEG q90, ~25 KB per frame × ~520K frames) |
 | `yolo/` | < 100 MB (all symlinks) |
 | Total active | ~70-115 GB |
 

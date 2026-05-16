@@ -46,16 +46,28 @@ local function write(cmd, value)
     f:close()
 end
 
+local function current_fps()
+    return mp.get_property_number("container-fps")
+        or mp.get_property_number("estimated-vf-fps")
+        or mp.get_property_number("fps")
+        or 30
+end
+
+local function seek_frames(n)
+    -- mpv has no native multi-frame step, but layer-per-frame timelapses are
+    -- short enough that exact-mode seek by n/fps lands on a precise frame.
+    local fps = current_fps()
+    mp.commandv("seek", string.format("%.6f", n / fps), "exact")
+end
+
 mp.add_key_binding("ENTER", "labeler-save", function()
     local frame = mp.get_property_number("estimated-frame-number")
     local t = mp.get_property_number("time-pos") or 0
     if frame == nil then
-        -- Fallback when mpv can't estimate: derive frame from time-pos × container fps.
-        local fps = mp.get_property_number("container-fps") or mp.get_property_number("fps") or 0
-        frame = math.floor(t * fps + 0.5)
+        frame = math.floor(t * current_fps() + 0.5)
     end
     write("save", string.format("%d", frame))
-    mp.osd_message(string.format("SAVED failure_at_frame = %d  (t = %.1fs)", frame, t), 1)
+    mp.osd_message(string.format("SAVED failure_at_frame = %d  (layer ≈ %d)", frame, frame + 1), 1)
     mp.add_timeout(0.4, function() mp.command("quit 0") end)
 end)
 
@@ -65,10 +77,24 @@ mp.add_key_binding("Q", "labeler-quit", function()
     mp.add_timeout(0.4, function() mp.command("quit 0") end)
 end)
 
-mp.add_key_binding("Z", "labeler-back-30",  function() mp.command("seek -30") end)
-mp.add_key_binding("X", "labeler-fwd-30",   function() mp.command("seek 30")  end)
-mp.add_key_binding("Ctrl+z", "labeler-back-120", function() mp.command("seek -120") end)
-mp.add_key_binding("Ctrl+x", "labeler-fwd-120",  function() mp.command("seek 120")  end)
+-- Frame-based seek (overrides mpv's time-based defaults; layer-per-frame
+-- timelapses are too short for second-based scrubbing to be useful).
+mp.add_key_binding("LEFT",   "labeler-back-5",   function() seek_frames(-5)   end)
+mp.add_key_binding("RIGHT",  "labeler-fwd-5",    function() seek_frames(5)    end)
+mp.add_key_binding("UP",     "labeler-fwd-25",   function() seek_frames(25)   end)
+mp.add_key_binding("DOWN",   "labeler-back-25",  function() seek_frames(-25)  end)
+mp.add_key_binding("Z",      "labeler-back-100", function() seek_frames(-100) end)
+mp.add_key_binding("X",      "labeler-fwd-100",  function() seek_frames(100)  end)
+mp.add_key_binding("Ctrl+z", "labeler-back-500", function() seek_frames(-500) end)
+mp.add_key_binding("Ctrl+x", "labeler-fwd-500",  function() seek_frames(500)  end)
+
+-- Continuously show current frame number on the OSD so the user always knows
+-- where they are without having to press 'o' (mpv's default stats key).
+mp.observe_property("estimated-frame-number", "number", function(_, value)
+    if value ~= nil then
+        mp.commandv("show-text", string.format("frame %d", value), 200)
+    end
+end)
 """
 
 
@@ -168,10 +194,11 @@ def main() -> int:
         print("Nothing to label — every failed print already has failure_at_frame.")
         return 0
 
-    print(f"Labeling {len(pending_indices)} failed timelapses. mpv keys:")
-    print("  ←/→: ±5s   shift+←/→: ±1s   ↑/↓: ±60s   Z/X: ±30s   ctrl+Z/X: ±2min")
-    print("  ,/.: frame step   [/]: speed   space: pause")
-    print("  ENTER: save current time and advance")
+    print(f"Labeling {len(pending_indices)} failed timelapses. mpv keys (each frame = one print layer):")
+    print("  ,/.: ±1 layer (frame step)   ←/→: ±5 layers   ↑/↓: ±25 layers")
+    print("  Z/X: ±100 layers             ctrl+Z/X: ±500 layers")
+    print("  [/]: playback speed   space: pause")
+    print("  ENTER: save current frame as failure_at_frame and advance")
     print("  q: skip this video (mpv default close)")
     print("  shift+Q: quit session (progress already saved)")
     print()

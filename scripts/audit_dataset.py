@@ -326,9 +326,9 @@ def summarize(rows: list[dict]) -> dict:
     printer_failure_counts = Counter(r["printer_id"] for r in failed)
 
     resolutions = Counter(r["_resolution"] for r in rows if r.get("_resolution"))
-    fps_values = [r["_fps"] for r in rows if r.get("_fps")]
-    seconds_per_frame_values = [1.0 / f for f in fps_values if f and f > 0]
-    durations = [float(r["duration_seconds"]) for r in rows if r.get("duration_seconds")]
+    # Bucket fps to nearest integer so 29.97 and 30.0 land in the same bin.
+    fps_buckets = Counter(round(r["_fps"]) for r in rows if r.get("_fps"))
+    layer_counts = [int(r["frame_count"]) for r in rows if (r.get("frame_count") or "").strip()]
 
     return {
         "total_successful": len(successful),
@@ -337,11 +337,9 @@ def summarize(rows: list[dict]) -> dict:
         "printer_counts": printer_counts,
         "printer_failure_counts": printer_failure_counts,
         "resolutions": resolutions,
+        "fps_buckets": fps_buckets,
+        "layer_counts": layer_counts,
         "total": len(rows),
-        "avg_seconds_per_frame": mean(seconds_per_frame_values) if seconds_per_frame_values else None,
-        "avg_fps": mean(fps_values) if fps_values else None,
-        "avg_duration_seconds": mean(durations) if durations else None,
-        "total_duration_hours": sum(durations) / 3600 if durations else 0,
     }
 
 
@@ -353,13 +351,19 @@ def render_stdout_summary(s: dict) -> str:
     for ft in CANONICAL_FAILURE_TYPES:
         lines.append(f"  - {ft}: {s['failure_counts'].get(ft, 0)}")
     lines.append("")
-    if s["avg_seconds_per_frame"]:
+    if s["fps_buckets"]:
+        total = sum(s["fps_buckets"].values())
+        parts = [f"{fps} fps: {n}" for fps, n in sorted(s["fps_buckets"].items())]
+        lines.append(f"Encoded fps (one frame = one print layer): {', '.join(parts)}")
+        if len(s["fps_buckets"]) > 1:
+            lines.append("  -- mixed fps is fine: frame index = layer index regardless of encode rate")
+    if s["layer_counts"]:
+        lc = sorted(s["layer_counts"])
+        median = lc[len(lc) // 2]
         lines.append(
-            f"Frame rate (avg per timelapse): 1 frame / {s['avg_seconds_per_frame']:.1f}s "
-            f"(encoded fps avg: {s['avg_fps']:.2f})"
+            f"Layer count per print: min={lc[0]}  median={median}  max={lc[-1]}  "
+            f"(total layers in archive: {sum(lc):,})"
         )
-    else:
-        lines.append("Frame rate: unknown (ffprobe could not read fps)")
     if s["resolutions"]:
         total = sum(s["resolutions"].values())
         parts = [f"{res} ({n / total:.0%})" for res, n in s["resolutions"].most_common()]
@@ -382,13 +386,7 @@ def render_stdout_summary(s: dict) -> str:
         for printer in missing:
             lines.append(f"  {printer}: 0 prints  ← NOT SEEN")
     lines.append("")
-    if s["avg_duration_seconds"]:
-        lines.append(
-            f"Avg timelapse duration: {s['avg_duration_seconds']/60:.1f} min "
-            f"(total archive: {s['total_duration_hours']:.1f} hours)"
-        )
-    lines.append("")
-    lines.append("Failure timestamp precision: TBD — run M1.5 (label_failure_boundaries.py) next.")
+    lines.append("Failure boundary precision: TBD — run M1.5 (label_failure_boundaries.py) next.")
     lines.append("")
     lines.append("Decision gates:")
     thin_classes = [ft for ft in CANONICAL_FAILURE_TYPES if s["failure_counts"].get(ft, 0) < MIN_CLASS_EXAMPLES]
@@ -424,12 +422,19 @@ def render_audit_md(s: dict, generated_at: str, videos_root: Path) -> str:
         for res, n in s["resolutions"].most_common():
             lines.append(f"| {res} | {n} | {n / total:.0%} |")
         lines.append("")
-    if s["avg_seconds_per_frame"]:
-        lines.append(f"- Avg frame interval: **1 frame / {s['avg_seconds_per_frame']:.1f}s**")
-        lines.append(f"- Avg encoded fps: {s['avg_fps']:.2f}")
-    if s["avg_duration_seconds"]:
-        lines.append(f"- Avg timelapse duration: **{s['avg_duration_seconds']/60:.1f} min**")
-        lines.append(f"- Total archive duration: {s['total_duration_hours']:.1f} hours")
+    if s["fps_buckets"]:
+        lines.append("| Encoded fps | Count |")
+        lines.append("|---|---|")
+        for fps, n in sorted(s["fps_buckets"].items()):
+            lines.append(f"| {fps} | {n} |")
+        lines.append("")
+        lines.append("_One frame = one print layer. Mixed encoded fps does not affect labels._")
+        lines.append("")
+    if s["layer_counts"]:
+        lc = sorted(s["layer_counts"])
+        median = lc[len(lc) // 2]
+        lines.append(f"- Layer count per print — min: **{lc[0]}**, median: **{median}**, max: **{lc[-1]}**")
+        lines.append(f"- Total layers in archive: **{sum(lc):,}**")
     lines.append("")
     lines.append("## Per-printer distribution")
     lines.append("")
@@ -500,9 +505,11 @@ def main() -> int:
                 d["_resolution"] = None
                 d["_fps"] = None
                 d["duration_seconds"] = ""
+                d["frame_count"] = ""
                 d["started_at"] = ""
                 continue
             d["duration_seconds"] = str(int(round(info["duration"]))) if info.get("duration") else ""
+            d["frame_count"] = str(info["nb_frames"]) if info.get("nb_frames") else ""
             d["_resolution"] = format_resolution(info.get("width"), info.get("height"))
             d["_fps"] = info.get("fps")
             d["started_at"] = info.get("creation_time") or ""
@@ -524,6 +531,7 @@ def main() -> int:
     # Initialize CSV-shaped fields on every row.
     for d in discoveries:
         d.setdefault("failure_at_frame", "")
+        d.setdefault("frame_count", "")
         d.setdefault("failure_type", d.get("failure_type") or "")
         d.setdefault("started_at", d.get("started_at") or "")
 
@@ -534,7 +542,7 @@ def main() -> int:
 
     fieldnames = [
         "print_id", "source_file", "printer_id", "started_at",
-        "outcome", "failure_type", "failure_at_frame", "duration_seconds",
+        "outcome", "failure_type", "failure_at_frame", "frame_count", "duration_seconds",
     ]
     csv_rows = [{k: r.get(k, "") for k in fieldnames} for r in discoveries]
     save_labels_atomic(labels_path, csv_rows, fieldnames)
