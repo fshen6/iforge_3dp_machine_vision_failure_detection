@@ -56,12 +56,29 @@ STAGE2_MAP: dict[str, str] = {
 STAGE2_CLASSES = sorted(set(STAGE2_MAP.values()))
 
 
-def make_symlink(target: Path, link: Path) -> None:
-    """Idempotent relative symlink."""
+def default_link_mode() -> str:
+    """symlink on POSIX, hardlink on Windows (no admin/dev-mode required)."""
+    return "hardlink" if os.name == "nt" else "symlink"
+
+
+def make_link(target: Path, link: Path, mode: str) -> None:
+    """Idempotent link via the chosen strategy.
+
+    - symlink:  cheap, relative; requires admin / Developer Mode on Windows
+    - hardlink: identical to the source from a reader's POV; same volume only
+    - copy:     duplicates bytes; portable; uses ~10 GB for this dataset
+    """
     link.parent.mkdir(parents=True, exist_ok=True)
     if link.is_symlink() or link.exists():
         return
-    link.symlink_to(os.path.relpath(target, link.parent))
+    if mode == "symlink":
+        link.symlink_to(os.path.relpath(target, link.parent))
+    elif mode == "hardlink":
+        os.link(target, link)
+    elif mode == "copy":
+        shutil.copy2(target, link)
+    else:
+        raise ValueError(f"unknown link mode: {mode}")
 
 
 def main() -> int:
@@ -72,8 +89,13 @@ def main() -> int:
     p.add_argument("--out-dir",    default=Path("yolo"),        type=Path)
     p.add_argument("--ambiguity-layers", default=5, type=int)
     p.add_argument("--wipe", action="store_true",
-                   help="delete out-dir before building (cheap; symlinks only)")
+                   help="delete out-dir before building")
+    p.add_argument("--link-mode", default=default_link_mode(),
+                   choices=("symlink", "hardlink", "copy"),
+                   help="how to materialise yolo entries (default: symlink on "
+                        "POSIX, hardlink on Windows)")
     args = p.parse_args()
+    print(f"Link mode: {args.link_mode}")
 
     if args.wipe and args.out_dir.exists():
         shutil.rmtree(args.out_dir)
@@ -123,7 +145,7 @@ def main() -> int:
             if not is_failure:
                 # Healthy print: every frame → stage1 healthy
                 link = args.out_dir / "stage1" / split / "healthy" / f"{pid}_{frame_idx:06d}.jpg"
-                make_symlink(frame_path.resolve(), link)
+                make_link(frame_path.resolve(), link, args.link_mode)
                 counts["stage1"][split]["healthy"] += 1
                 frames_linked += 1
                 continue
@@ -138,13 +160,13 @@ def main() -> int:
             link_name = f"{pid}_{frame_idx:06d}.jpg"
 
             s1_link = args.out_dir / "stage1" / split / "failure" / link_name
-            make_symlink(frame_path.resolve(), s1_link)
+            make_link(frame_path.resolve(), s1_link, args.link_mode)
             counts["stage1"][split]["failure"] += 1
             frames_linked += 1
 
             if s2_class:
                 s2_link = args.out_dir / "stage2" / split / s2_class / link_name
-                make_symlink(frame_path.resolve(), s2_link)
+                make_link(frame_path.resolve(), s2_link, args.link_mode)
                 counts["stage2"][split][s2_class] += 1
 
     # Report
