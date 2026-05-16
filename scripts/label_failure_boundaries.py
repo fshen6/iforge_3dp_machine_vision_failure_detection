@@ -88,7 +88,7 @@ def load_rows(labels_path: Path) -> tuple[list[dict], list[str]]:
             f"Run Milestone 1 (scripts/audit_dataset.py) first to bootstrap labels.csv "
             f"from the raw/ filenames. See docs/ENGINEERING_PLAN.md."
         )
-    with labels_path.open(newline="") as f:
+    with labels_path.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         fieldnames = reader.fieldnames or []
         rows = list(reader)
@@ -102,7 +102,8 @@ def load_rows(labels_path: Path) -> tuple[list[dict], list[str]]:
 def save_rows_atomic(labels_path: Path, rows: list[dict], fieldnames: list[str]) -> None:
     fd, tmp_path = tempfile.mkstemp(prefix=".labels.", suffix=".csv.tmp", dir=str(labels_path.parent))
     try:
-        with os.fdopen(fd, "w", newline="") as f:
+        # Force UTF-8 — Windows defaults to cp1252 and would crash on non-ASCII fields.
+        with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)

@@ -221,7 +221,8 @@ def ffprobe(ffprobe_bin: str, path: Path) -> dict:
 def load_existing_labels(labels_path: Path) -> list[dict]:
     if not labels_path.exists():
         return []
-    with labels_path.open(newline="") as f:
+    # utf-8-sig transparently strips a BOM if Excel ever round-tripped this file.
+    with labels_path.open(newline="", encoding="utf-8-sig") as f:
         return [r for r in csv.DictReader(f) if r.get("print_id")]
 
 
@@ -295,7 +296,9 @@ def save_labels_atomic(labels_path: Path, rows: list[dict], fieldnames: list[str
     labels_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".labels.", suffix=".csv.tmp", dir=str(labels_path.parent))
     try:
-        with os.fdopen(fd, "w", newline="") as f:
+        # Force UTF-8: Windows would otherwise pick cp1252 from the locale and choke on
+        # non-ASCII characters (em dashes, accented chars, ffprobe timezone glyphs).
+        with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
@@ -542,7 +545,7 @@ def main() -> int:
         videos_root=videos_root,
     )
     args.audit_md.parent.mkdir(parents=True, exist_ok=True)
-    args.audit_md.write_text(audit_md)
+    args.audit_md.write_text(audit_md, encoding="utf-8")
 
     print(f"\nWrote {labels_path} ({len(csv_rows)} rows)")
     print(f"Wrote {args.audit_md}")
