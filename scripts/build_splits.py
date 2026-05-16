@@ -33,8 +33,9 @@ def main() -> int:
     p.add_argument("--train", default=0.70, type=float)
     p.add_argument("--val",   default=0.15, type=float)
     p.add_argument("--test",  default=0.15, type=float)
-    p.add_argument("--eval-fraction-of-test", default=0.40, type=float,
-                   help="fraction of test pulled out as eval (curated separately)")
+    p.add_argument("--eval-fraction-of-test", default=0.10, type=float,
+                   help="fraction of test pulled out as eval (target ~10-20 prints, "
+                        "hand-curated separately)")
     p.add_argument("--seed",  default=42, type=int)
     args = p.parse_args()
 
@@ -87,14 +88,31 @@ def main() -> int:
     val_idx  = [rest_idx[i] for i in val_local]
     test_idx = [rest_idx[i] for i in test_local]
 
-    # Pull eval out of test (stratified)
-    test_strata = [strata[i] for i in test_idx]
-    sss3 = StratifiedShuffleSplit(
-        n_splits=1, test_size=args.eval_fraction_of_test, random_state=args.seed
-    )
-    test_only_local, eval_local = next(
-        sss3.split([pids[i] for i in test_idx], test_strata)
-    )
+    # Pull eval out of test. Use OUTCOME-only stratification (success vs failure)
+    # because some (printer × outcome) strata land with only 1 print in test and
+    # StratifiedShuffleSplit requires >= 2 per class. Eval is hand-curated for
+    # hard cases anyway, so printer-level representation isn't critical here.
+    test_outcomes = [
+        next(r for r in kept if r["print_id"] == pids[i])["outcome"]
+        for i in test_idx
+    ]
+    try:
+        sss3 = StratifiedShuffleSplit(
+            n_splits=1, test_size=args.eval_fraction_of_test, random_state=args.seed
+        )
+        test_only_local, eval_local = next(
+            sss3.split([pids[i] for i in test_idx], test_outcomes)
+        )
+    except ValueError:
+        # Last-ditch fallback: non-stratified shuffle. Should be unreachable for
+        # any non-pathological dataset, but doesn't crash on edge cases.
+        import random
+        rng = random.Random(args.seed)
+        n_eval = max(1, round(len(test_idx) * args.eval_fraction_of_test))
+        order = list(range(len(test_idx)))
+        rng.shuffle(order)
+        eval_local = order[:n_eval]
+        test_only_local = order[n_eval:]
     eval_idx = [test_idx[i] for i in eval_local]
     test_idx = [test_idx[i] for i in test_only_local]
 
