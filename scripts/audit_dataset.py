@@ -1,23 +1,39 @@
 #!/usr/bin/env python3
 """Dataset audit (Milestone 1).
 
-Walks raw/successful/ and raw/failed/ under --videos-root, parses filenames
-into (print_id, printer_id, failure_type), ffprobes each file for duration
-and resolution, and produces:
+Walks the canonical dataset layout under --videos-root, ffprobes each video
+in parallel for duration and resolution, and produces:
 
-  1. labels.csv  — the dataset's single source of truth (idempotent: any
-                   failure_at_seconds and started_at values already present
-                   for a print_id are preserved on re-audit)
-  2. DATASET_AUDIT.md — one-page human-readable summary
-  3. stdout summary matching the format in docs/ENGINEERING_PLAN.md M1
+  1. labels.csv  — the dataset's single source of truth. Idempotent across
+                   re-runs: print_ids and failure_at_seconds values are
+                   preserved by matching source_file (or printer_id+basename
+                   as a fallback, so a file moved between failure-type
+                   folders keeps its timestamp).
+  2. DATASET_AUDIT.md — one-page human-readable summary.
+  3. stdout summary matching the format in docs/ENGINEERING_PLAN.md M1.
 
-Usage:
-    python scripts/audit_dataset.py \\
-        --videos-root /Volumes/External/print_data
+Expected layout (folders are the source of truth for outcome, failure_type,
+and printer_id — filenames themselves are not parsed):
 
-Filename conventions (see docs/DATASET_STRUCTURE.md):
-    raw/successful/print_001_printer03.mp4
-    raw/failed/print_456_printer02_bed_adhesion.mp4
+    <videos-root>/raw/
+        successful/
+            Tolstoy/   *.mp4
+            Bell/      *.mp4
+            ...
+        failed/
+            bed_adhesion/
+                Tolstoy/   *.mp4
+                Bell/      *.mp4
+                ...
+            spaghetti/
+                <printer>/ *.mp4
+            layer_shift/
+            other/
+
+Usage (cross-platform):
+
+    python scripts/audit_dataset.py --videos-root D:\\print_data
+    python scripts/audit_dataset.py --videos-root /Volumes/Drive/print_data
 
 Acceptance: completes without error, prints per-class counts, surfaces any
 class with < 30 examples (decision gate for whether stage 2 is viable).
@@ -33,21 +49,18 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections import Counter, defaultdict
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean
-from typing import Iterable
 
+CANONICAL_PRINTERS = (
+    "Tolstoy", "Bell", "Socrates", "Einstein",
+    "Beethoven", "Watt", "Hypatia", "Picasso",
+)
 CANONICAL_FAILURE_TYPES = ("bed_adhesion", "spaghetti", "layer_shift", "other")
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".m4v"}
-
-# print_001_printer03[_<failure_type>]  (printer_03 / printer03 both accepted)
-FILENAME_RE = re.compile(
-    r"^(?P<print_id>print_\d+)_printer_?(?P<printer_num>\d+)(?:_(?P<rest>.+))?$",
-    re.IGNORECASE,
-)
 
 # Min examples per failure class before stage 2 is viable (engineering plan M1 gate).
 MIN_CLASS_EXAMPLES = 30
@@ -63,7 +76,7 @@ def parse_args() -> argparse.Namespace:
         "--videos-root",
         type=Path,
         required=True,
-        help="Directory containing raw/successful/ and raw/failed/.",
+        help="Directory containing raw/successful/<printer>/ and raw/failed/<type>/<printer>/.",
     )
     p.add_argument(
         "--labels",
@@ -87,46 +100,76 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def normalize_printer_id(num: str) -> str:
-    return f"printer_{int(num):02d}"
+def find_videos(directory: Path) -> list[Path]:
+    if not directory.exists():
+        return []
+    return sorted(p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES)
 
 
-def normalize_failure_type(raw: str | None) -> tuple[str, bool]:
-    """Return (canonical_type, was_recognized). Unknown types fall back to 'other'."""
-    if not raw:
-        return ("other", False)
-    s = raw.strip().lower()
-    if s in CANONICAL_FAILURE_TYPES:
-        return (s, True)
-    if s == "other_failure":
-        return ("other", True)
-    return ("other", False)
-
-
-def parse_filename(stem: str, outcome: str) -> tuple[str, str, str | None, list[str]]:
-    """Parse a filename stem into (print_id, printer_id, failure_type, warnings)."""
-    m = FILENAME_RE.match(stem)
+def walk_dataset(videos_root: Path) -> tuple[list[dict], list[str]]:
+    """Return ([{path, outcome, failure_type, printer_id, source_file}, ...], warnings)."""
+    successful_root = videos_root / "raw" / "successful"
+    failed_root = videos_root / "raw" / "failed"
+    discoveries: list[dict] = []
     warnings: list[str] = []
-    if not m:
-        return ("", "", None, [f"could not parse filename: {stem!r}"])
-    print_id = m.group("print_id").lower()
-    printer_id = normalize_printer_id(m.group("printer_num"))
-    rest = m.group("rest")
-    if outcome == "success":
-        if rest:
-            warnings.append(f"{stem!r}: unexpected trailing tokens for success file: {rest!r}")
-        return (print_id, printer_id, None, warnings)
-    # failure
-    failure_type, recognized = normalize_failure_type(rest)
-    if not recognized:
-        warnings.append(
-            f"{stem!r}: unrecognized failure type {rest!r}, normalized to 'other'"
-        )
-    return (print_id, printer_id, failure_type, warnings)
+
+    canonical_printer_set = set(CANONICAL_PRINTERS)
+    canonical_failure_set = set(CANONICAL_FAILURE_TYPES)
+
+    # raw/successful/<printer>/*.mp4
+    if successful_root.exists():
+        for printer_dir in sorted(p for p in successful_root.iterdir() if p.is_dir()):
+            printer_id = printer_dir.name
+            if printer_id not in canonical_printer_set:
+                warnings.append(
+                    f"unknown printer folder {printer_id!r} under {successful_root.as_posix()} "
+                    f"(canonical: {', '.join(CANONICAL_PRINTERS)})"
+                )
+            for video in find_videos(printer_dir):
+                discoveries.append({
+                    "_path": video,
+                    "outcome": "success",
+                    "failure_type": None,
+                    "printer_id": printer_id,
+                    "source_file": video.relative_to(videos_root).as_posix(),
+                })
+
+    # raw/failed/<failure_type>/<printer>/*.mp4
+    if failed_root.exists():
+        for ft_dir in sorted(p for p in failed_root.iterdir() if p.is_dir()):
+            failure_type = ft_dir.name
+            if failure_type not in canonical_failure_set:
+                warnings.append(
+                    f"unknown failure_type folder {failure_type!r} under {failed_root.as_posix()} "
+                    f"(canonical: {', '.join(CANONICAL_FAILURE_TYPES)}); skipping its contents"
+                )
+                continue
+            for printer_dir in sorted(p for p in ft_dir.iterdir() if p.is_dir()):
+                printer_id = printer_dir.name
+                if printer_id not in canonical_printer_set:
+                    warnings.append(
+                        f"unknown printer folder {printer_id!r} under {ft_dir.as_posix()}"
+                    )
+                for video in find_videos(printer_dir):
+                    discoveries.append({
+                        "_path": video,
+                        "outcome": "failure",
+                        "failure_type": failure_type,
+                        "printer_id": printer_id,
+                        "source_file": video.relative_to(videos_root).as_posix(),
+                    })
+            # Also catch videos placed directly under raw/failed/<failure_type>/ without a printer subfolder.
+            stray = find_videos(ft_dir)
+            if stray:
+                warnings.append(
+                    f"{len(stray)} video(s) under {ft_dir.as_posix()} are missing a printer subfolder; ignored"
+                )
+
+    return discoveries, warnings
 
 
 def ffprobe(ffprobe_bin: str, path: Path) -> dict:
-    """Return {duration, width, height, fps, creation_time} or {} on failure."""
+    """Return {duration, width, height, fps, creation_time} or {error: ...} on failure."""
     try:
         proc = subprocess.run(
             [
@@ -151,7 +194,7 @@ def ffprobe(ffprobe_bin: str, path: Path) -> dict:
         return {"error": f"ffprobe JSON parse failed: {e}"}
     stream = (data.get("streams") or [{}])[0]
     fmt = data.get("format") or {}
-    out = {}
+    out: dict = {}
     try:
         out["duration"] = float(fmt.get("duration", 0)) or None
     except (TypeError, ValueError):
@@ -175,17 +218,77 @@ def ffprobe(ffprobe_bin: str, path: Path) -> dict:
     return out
 
 
-def find_videos(root: Path) -> list[Path]:
-    if not root.exists():
-        return []
-    return sorted(p for p in root.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES)
-
-
-def load_existing_labels(labels_path: Path) -> dict[str, dict]:
+def load_existing_labels(labels_path: Path) -> list[dict]:
     if not labels_path.exists():
-        return {}
+        return []
     with labels_path.open(newline="") as f:
-        return {r["print_id"]: r for r in csv.DictReader(f) if r.get("print_id")}
+        return [r for r in csv.DictReader(f) if r.get("print_id")]
+
+
+def assign_print_ids(rows: list[dict], existing: list[dict]) -> None:
+    """Assign stable print_ids. Reuse from existing labels.csv by source_file or
+    (printer_id, basename) fallback. New rows get the next available print_0NNN."""
+    by_source = {r["source_file"]: r for r in existing}
+    by_printer_basename = {(r["printer_id"], Path(r["source_file"]).name): r for r in existing}
+    used: set[str] = set()
+    pid_re = re.compile(r"^print_(\d+)$")
+
+    for row in rows:
+        prev = by_source.get(row["source_file"]) or by_printer_basename.get(
+            (row["printer_id"], Path(row["source_file"]).name)
+        )
+        if prev and prev.get("print_id"):
+            row["print_id"] = prev["print_id"]
+            used.add(prev["print_id"])
+
+    # Highest existing numeric ID; new IDs start above it.
+    max_n = 0
+    for r in existing:
+        m = pid_re.match(r.get("print_id", ""))
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+
+    next_n = max_n + 1
+    for row in rows:
+        if row.get("print_id"):
+            continue
+        while f"print_{next_n:04d}" in used:
+            next_n += 1
+        row["print_id"] = f"print_{next_n:04d}"
+        used.add(row["print_id"])
+        next_n += 1
+
+
+def merge_preserved_fields(rows: list[dict], existing: list[dict]) -> list[str]:
+    """Copy human-curated fields from existing rows to new rows by source_file
+    or (printer_id, basename) fallback. Returns warnings."""
+    by_source = {r["source_file"]: r for r in existing}
+    by_printer_basename = {(r["printer_id"], Path(r["source_file"]).name): r for r in existing}
+    warnings: list[str] = []
+
+    for row in rows:
+        prev = by_source.get(row["source_file"]) or by_printer_basename.get(
+            (row["printer_id"], Path(row["source_file"]).name)
+        )
+        if not prev:
+            continue
+        if (prev.get("failure_at_seconds") or "").strip():
+            row["failure_at_seconds"] = prev["failure_at_seconds"]
+        if (prev.get("started_at") or "").strip():
+            row["started_at"] = prev["started_at"]
+        # If a human reclassified failure_type in labels.csv (vs the folder), flag the conflict
+        # but trust the folder — it's the new source of truth.
+        if (
+            row["outcome"] == "failure"
+            and (prev.get("failure_type") or "").strip()
+            and prev["failure_type"] != row["failure_type"]
+        ):
+            warnings.append(
+                f"{row['print_id']} ({row['source_file']}): failure_type changed "
+                f"{prev['failure_type']!r} → {row['failure_type']!r} based on folder; if the "
+                f"old value was correct, move the file back."
+            )
+    return warnings
 
 
 def save_labels_atomic(labels_path: Path, rows: list[dict], fieldnames: list[str]) -> None:
@@ -253,21 +356,25 @@ def render_stdout_summary(s: dict) -> str:
         lines.append("Frame rate: unknown (ffprobe could not read fps)")
     if s["resolutions"]:
         total = sum(s["resolutions"].values())
-        parts = []
-        for res, n in s["resolutions"].most_common():
-            parts.append(f"{res} ({n / total:.0%})")
+        parts = [f"{res} ({n / total:.0%})" for res, n in s["resolutions"].most_common()]
         lines.append("Resolution: " + ", ".join(parts))
         if len(s["resolutions"]) > 1:
             lines.append("  -- mixed resolutions; normalize at decode")
     lines.append("")
     lines.append("Per-printer distribution:")
     if s["printer_counts"]:
-        # one printer per line — easier to scan than a single comma-joined line
-        for printer in sorted(s["printer_counts"]):
+        # Sort canonical printers first (in their declared order), then any unknowns alphabetically.
+        canonical_seen = [p for p in CANONICAL_PRINTERS if p in s["printer_counts"]]
+        unknown = sorted(p for p in s["printer_counts"] if p not in CANONICAL_PRINTERS)
+        missing = [p for p in CANONICAL_PRINTERS if p not in s["printer_counts"]]
+        for printer in canonical_seen + unknown:
             total_n = s["printer_counts"][printer]
             failures_n = s["printer_failure_counts"].get(printer, 0)
             warn = "  ← NO FAILURES" if failures_n == 0 else ""
-            lines.append(f"  {printer}: {total_n} prints ({failures_n} failures){warn}")
+            unk = "  (unknown printer)" if printer not in CANONICAL_PRINTERS else ""
+            lines.append(f"  {printer}: {total_n} prints ({failures_n} failures){warn}{unk}")
+        for printer in missing:
+            lines.append(f"  {printer}: 0 prints  ← NOT SEEN")
     lines.append("")
     if s["avg_duration_seconds"]:
         lines.append(
@@ -291,7 +398,7 @@ def render_stdout_summary(s: dict) -> str:
 
 def render_audit_md(s: dict, generated_at: str, videos_root: Path) -> str:
     lines = ["# Dataset Audit", ""]
-    lines.append(f"_Generated {generated_at} from `{videos_root}` by `scripts/audit_dataset.py`._")
+    lines.append(f"_Generated {generated_at} from `{videos_root.as_posix()}` by `scripts/audit_dataset.py`._")
     lines.append("")
     lines.append("## Class counts")
     lines.append("")
@@ -322,11 +429,16 @@ def render_audit_md(s: dict, generated_at: str, videos_root: Path) -> str:
     lines.append("")
     lines.append("| Printer | Prints | Failures |")
     lines.append("|---|---|---|")
-    for printer in sorted(s["printer_counts"]):
+    canonical_seen = [p for p in CANONICAL_PRINTERS if p in s["printer_counts"]]
+    unknown = sorted(p for p in s["printer_counts"] if p not in CANONICAL_PRINTERS)
+    missing = [p for p in CANONICAL_PRINTERS if p not in s["printer_counts"]]
+    for printer in canonical_seen + unknown:
         lines.append(
             f"| {printer} | {s['printer_counts'][printer]} | "
             f"{s['printer_failure_counts'].get(printer, 0)} |"
         )
+    for printer in missing:
+        lines.append(f"| {printer} _(missing)_ | 0 | 0 |")
     lines.append("")
     lines.append("## Decision gates")
     lines.append("")
@@ -348,104 +460,81 @@ def main() -> int:
     videos_root = args.videos_root.resolve()
     labels_path = (args.labels or (videos_root / "labels.csv")).resolve()
 
-    successful_dir = videos_root / "raw" / "successful"
-    failed_dir = videos_root / "raw" / "failed"
-    if not successful_dir.exists() and not failed_dir.exists():
+    successful_root = videos_root / "raw" / "successful"
+    failed_root = videos_root / "raw" / "failed"
+    if not successful_root.exists() and not failed_root.exists():
         sys.exit(
-            f"error: neither {successful_dir} nor {failed_dir} exists. "
-            f"Check --videos-root."
+            f"error: neither {successful_root} nor {failed_root} exists. "
+            f"Expected layout:\n"
+            f"  raw/successful/<Printer>/*.mp4\n"
+            f"  raw/failed/<failure_type>/<Printer>/*.mp4\n"
+            f"  Printers: {', '.join(CANONICAL_PRINTERS)}\n"
+            f"  failure_types: {', '.join(CANONICAL_FAILURE_TYPES)}"
         )
 
-    # Discover and parse filenames.
-    discoveries: list[tuple[Path, str]] = (
-        [(p, "success") for p in find_videos(successful_dir)]
-        + [(p, "failure") for p in find_videos(failed_dir)]
-    )
+    discoveries, walk_warnings = walk_dataset(videos_root)
     if not discoveries:
-        sys.exit(f"error: no video files found under {videos_root}/raw/")
+        sys.exit(f"error: no video files found under {videos_root.as_posix()}/raw/")
 
-    warnings: list[str] = []
-    parsed: dict[str, dict] = {}  # print_id -> partial row
-    for video_path, outcome in discoveries:
-        print_id, printer_id, failure_type, file_warnings = parse_filename(video_path.stem, outcome)
-        warnings.extend(file_warnings)
-        if not print_id:
-            continue
-        if print_id in parsed:
-            warnings.append(
-                f"duplicate print_id {print_id!r} — kept first ({parsed[print_id]['source_file']}), "
-                f"dropped {video_path.relative_to(videos_root)}"
-            )
-            continue
-        parsed[print_id] = {
-            "print_id": print_id,
-            "source_file": str(video_path.relative_to(videos_root)),
-            "printer_id": printer_id,
-            "started_at": "",
-            "outcome": outcome,
-            "failure_type": failure_type or "",
-            "failure_at_seconds": "",
-            "duration_seconds": "",
-            "_path": video_path,
-        }
+    warnings = list(walk_warnings)
 
-    # ffprobe in parallel.
-    print(f"ffprobing {len(parsed)} videos with {args.workers} workers...", file=sys.stderr)
+    # ffprobe in parallel
+    print(f"ffprobing {len(discoveries)} videos with {args.workers} workers...", file=sys.stderr)
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = {ex.submit(ffprobe, args.ffprobe, r["_path"]): pid for pid, r in parsed.items()}
+        futures = {ex.submit(ffprobe, args.ffprobe, d["_path"]): d for d in discoveries}
         completed = 0
         for fut in as_completed(futures):
-            pid = futures[fut]
+            d = futures[fut]
             info = fut.result()
             completed += 1
             if completed % 50 == 0 or completed == len(futures):
                 print(f"  ffprobed {completed}/{len(futures)}", file=sys.stderr)
-            row = parsed[pid]
             if info.get("error"):
-                warnings.append(f"{row['source_file']}: ffprobe failed: {info['error']}")
-                row["_resolution"] = None
-                row["_fps"] = None
+                warnings.append(f"{d['source_file']}: ffprobe failed: {info['error']}")
+                d["_resolution"] = None
+                d["_fps"] = None
+                d["duration_seconds"] = ""
+                d["started_at"] = ""
                 continue
-            row["duration_seconds"] = str(int(round(info["duration"]))) if info.get("duration") else ""
-            row["_resolution"] = format_resolution(info.get("width"), info.get("height"))
-            row["_fps"] = info.get("fps")
-            if info.get("creation_time"):
-                row["started_at"] = info["creation_time"]
+            d["duration_seconds"] = str(int(round(info["duration"]))) if info.get("duration") else ""
+            d["_resolution"] = format_resolution(info.get("width"), info.get("height"))
+            d["_fps"] = info.get("fps")
+            d["started_at"] = info.get("creation_time") or ""
 
-    # Idempotent merge: preserve failure_at_seconds, started_at (if better), failure_type
-    # overrides from a prior labels.csv.
+    # Stable ordering: success before failure, then by failure_type, then by printer, then by source_file.
+    failure_order = {ft: i for i, ft in enumerate(CANONICAL_FAILURE_TYPES)}
+    printer_order = {p: i for i, p in enumerate(CANONICAL_PRINTERS)}
+
+    def sort_key(d: dict) -> tuple:
+        return (
+            0 if d["outcome"] == "success" else 1,
+            failure_order.get(d.get("failure_type") or "", 99),
+            printer_order.get(d["printer_id"], 99),
+            d["source_file"],
+        )
+
+    discoveries.sort(key=sort_key)
+
+    # Initialize CSV-shaped fields on every row.
+    for d in discoveries:
+        d.setdefault("failure_at_seconds", "")
+        d.setdefault("failure_type", d.get("failure_type") or "")
+        d.setdefault("started_at", d.get("started_at") or "")
+
+    # Idempotent merge with existing labels.csv: print_ids and human fields.
     existing = load_existing_labels(labels_path)
-    for pid, row in parsed.items():
-        prev = existing.get(pid)
-        if not prev:
-            continue
-        if prev.get("failure_at_seconds", "").strip():
-            row["failure_at_seconds"] = prev["failure_at_seconds"]
-        # Prefer human-curated started_at over ffprobe creation_time.
-        if prev.get("started_at", "").strip():
-            row["started_at"] = prev["started_at"]
-        # If a human re-categorized a failure (e.g. corrected from filename), keep it.
-        if prev.get("failure_type", "").strip() and prev.get("outcome") == "failure":
-            if prev["failure_type"] != row["failure_type"]:
-                warnings.append(
-                    f"{pid}: failure_type from filename ({row['failure_type']!r}) "
-                    f"differs from labels.csv ({prev['failure_type']!r}); keeping labels.csv value"
-                )
-            row["failure_type"] = prev["failure_type"]
+    assign_print_ids(discoveries, existing)
+    warnings.extend(merge_preserved_fields(discoveries, existing))
 
-    # Build the rows list in a stable order (success first, then failure, both sorted by print_id).
     fieldnames = [
         "print_id", "source_file", "printer_id", "started_at",
         "outcome", "failure_type", "failure_at_seconds", "duration_seconds",
     ]
-    ordered = sorted(parsed.values(), key=lambda r: (r["outcome"] != "success", r["print_id"]))
-    csv_rows = [{k: r.get(k, "") for k in fieldnames} for r in ordered]
+    csv_rows = [{k: r.get(k, "") for k in fieldnames} for r in discoveries]
     save_labels_atomic(labels_path, csv_rows, fieldnames)
 
-    # Summarize.
-    summary = summarize(ordered)
-    stdout = render_stdout_summary(summary)
-    print(stdout)
+    summary = summarize(discoveries)
+    print(render_stdout_summary(summary))
 
     audit_md = render_audit_md(
         summary,
